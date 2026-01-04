@@ -45,7 +45,7 @@ export interface WordBoundary {
  */
 export interface SynthesisResult {
   /**
-   * The generated audio as a Blob, which can be used in an <audio> element.
+   * The generated audio as a Blob, which can be used for playback.
    */
   audio: Blob;
   /**
@@ -54,9 +54,28 @@ export interface SynthesisResult {
   subtitle: WordBoundary[];
 }
 
+// Buffer concatenation utility with improved audio handling
+function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
+  if (arrays.length === 0) return new Uint8Array(0);
+  if (arrays.length === 1) return arrays[0];
+
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+
+  for (const arr of arrays) {
+    if (arr.length > 0) {
+      result.set(arr, offset);
+      offset += arr.length;
+    }
+  }
+
+  return result;
+}
+
 /**
- * Simple Edge TTS class that provides the same API as the standalone implementation
- * but uses the robust infrastructure of the modular project.
+ * Simple Edge TTS class for React Native applications.
+ * Provides an easy-to-use API for text-to-speech synthesis.
  */
 export class EdgeTTS {
   public text: string;
@@ -72,7 +91,7 @@ export class EdgeTTS {
    */
   constructor(
     text: string,
-    voice = "Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoxiaoNeural)",
+    voice = "Microsoft Server Speech Text to Speech Voice (en-US, EmmaMultilingualNeural)",
     options: ProsodyOptions = {}
   ) {
     this.text = text;
@@ -94,7 +113,7 @@ export class EdgeTTS {
       pitch: this.pitch,
     });
 
-    const audioChunks: Buffer[] = [];
+    const audioChunks: Uint8Array[] = [];
     const wordBoundaries: WordBoundary[] = [];
 
     for await (const chunk of communicate.stream()) {
@@ -109,9 +128,34 @@ export class EdgeTTS {
       }
     }
 
-    // Convert Buffer array to Blob
-    const audioBuffer = Buffer.concat(audioChunks);
-    const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
+    // Convert Uint8Array chunks to Blob
+    const audioBuffer = concatUint8Arrays(audioChunks);
+
+    let audioBlob: Blob;
+    try {
+      // Standard Blob creation
+      audioBlob = new Blob([audioBuffer as any], { type: "audio/mpeg" });
+    } catch (e) {
+      // Fallback for environments with restricted Blob support (e.g., React Native)
+      // This implements a minimal Blob-like object that satisfies the interface
+      audioBlob = {
+        size: audioBuffer.length,
+        type: "audio/mpeg",
+        arrayBuffer: async () => audioBuffer.buffer,
+        slice: (start?: number, end?: number, contentType?: string) => {
+          const sliced = audioBuffer.slice(start, end);
+          const blob = new Blob([sliced], { type: contentType || "audio/mpeg" });
+          return blob;
+        },
+        text: async () => new TextDecoder().decode(audioBuffer),
+        stream: () => new ReadableStream({
+          start(controller) {
+            controller.enqueue(audioBuffer);
+            controller.close();
+          }
+        })
+      } as unknown as Blob;
+    }
 
     return {
       audio: audioBlob,
@@ -121,7 +165,7 @@ export class EdgeTTS {
 }
 
 // ==================================================================================
-// Subtitle Generation Utilities (from code (54).ts)
+// Subtitle Generation Utilities
 // ==================================================================================
 
 /**
@@ -182,7 +226,4 @@ export function createSRT(wordBoundaries: WordBoundary[]): string {
     srtContent += `${word.text}\n\n`;
   });
   return srtContent;
-}
-
-// Universal alias for EdgeTTS (preferred naming)
-export { EdgeTTS as UniversalEdgeTTS }; 
+} 

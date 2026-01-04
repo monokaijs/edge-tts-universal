@@ -5,8 +5,8 @@
 export type TTSChunk = {
   /** The type of chunk - either audio data or word boundary metadata */
   type: "audio" | "WordBoundary";
-  /** Raw audio data buffer (present for audio chunks) */
-  data?: Buffer;
+  /** Raw audio data (present for audio chunks) */
+  data?: Uint8Array;
   /** Duration of the word in 100-nanosecond units (present for WordBoundary chunks) */
   duration?: number;
   /** Offset from the beginning in 100-nanosecond units (present for WordBoundary chunks) */
@@ -108,8 +108,8 @@ export type VoicesManagerFind = {
  * Internal state tracking for the Communicate class during streaming.
  */
 export type CommunicateState = {
-  /** Buffer for partial text data */
-  partialText: Buffer;
+  /** Partial text data */
+  partialText: Uint8Array;
   /** Timing offset compensation for multi-request scenarios */
   offsetCompensation: number;
   /** Last recorded duration offset for timing calculations */

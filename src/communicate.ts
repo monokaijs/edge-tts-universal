@@ -2,8 +2,6 @@ import {
   connectId,
   dateToString,
   escape,
-  getHeadersAndDataFromBinary,
-  getHeadersAndDataFromText,
   mkssml,
   removeIncompatibleCharacters,
   splitTextByByteLength,
@@ -17,15 +15,103 @@ import {
   WebSocketError
 } from "./exceptions";
 import { TTSConfig } from './tts_config';
-import { CommunicateState, TTSChunk } from './types';
-// Use isomorphic WebSocket that works in both Node.js and browsers
-import WebSocket from 'isomorphic-ws';
-import { DEFAULT_VOICE, WSS_URL, WSS_HEADERS, SEC_MS_GEC_VERSION } from './constants';
+import { DEFAULT_VOICE, WSS_URL, SEC_MS_GEC_VERSION, WSS_HEADERS } from './constants';
 import { DRM } from './drm';
-import { AxiosError } from 'axios';
 
-// HttpsProxyAgent will be imported dynamically when needed
-let HttpsProxyAgent: any;
+// Buffer handling utilities
+const BufferUtils = {
+  from: (input: string | ArrayBuffer | Uint8Array): Uint8Array => {
+    if (typeof input === 'string') {
+      return new TextEncoder().encode(input);
+    } else if (input instanceof ArrayBuffer) {
+      return new Uint8Array(input);
+    } else if (input instanceof Uint8Array) {
+      return input;
+    }
+    throw new Error('Unsupported input type for BufferUtils.from');
+  },
+
+  concat: (arrays: Uint8Array[]): Uint8Array => {
+    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const arr of arrays) {
+      result.set(arr, offset);
+      offset += arr.length;
+    }
+    return result;
+  },
+
+  isBuffer: (obj: any): obj is Uint8Array => {
+    return obj instanceof Uint8Array;
+  },
+
+  toString: (buffer: Uint8Array, encoding?: string): string => {
+    return new TextDecoder(encoding || 'utf-8').decode(buffer);
+  }
+};
+
+// Parse headers and data from text message
+function getHeadersAndDataFromText(message: Uint8Array): [{ [key: string]: string }, Uint8Array] {
+  const messageString = BufferUtils.toString(message);
+  const headerEndIndex = messageString.indexOf('\r\n\r\n');
+
+  const headers: { [key: string]: string } = {};
+  if (headerEndIndex !== -1) {
+    const headerString = messageString.substring(0, headerEndIndex);
+    const headerLines = headerString.split('\r\n');
+    for (const line of headerLines) {
+      const [key, value] = line.split(':', 2);
+      if (key && value) {
+        headers[key] = value.trim();
+      }
+    }
+  }
+
+  const headerByteLength = new TextEncoder().encode(messageString.substring(0, headerEndIndex + 4)).length;
+  return [headers, message.slice(headerByteLength)];
+}
+
+// Parse headers and data from binary message
+function getHeadersAndDataFromBinary(message: Uint8Array): [{ [key: string]: string }, Uint8Array] {
+  if (message.length < 2) {
+    throw new Error('Message too short to contain header length');
+  }
+
+  const headerLength = (message[0] << 8) | message[1]; // Read big-endian uint16
+  const headers: { [key: string]: string } = {};
+
+  if (headerLength > 0 && headerLength + 2 <= message.length) {
+    const headerBytes = message.slice(2, headerLength + 2);
+    const headerString = BufferUtils.toString(headerBytes);
+    const headerLines = headerString.split('\r\n');
+    for (const line of headerLines) {
+      const [key, value] = line.split(':', 2);
+      if (key && value) {
+        headers[key] = value.trim();
+      }
+    }
+  }
+
+  return [headers, message.slice(headerLength + 2)];
+}
+
+// State interface
+interface CommunicateState {
+  partialText: Uint8Array;
+  offsetCompensation: number;
+  lastDurationOffset: number;
+  streamWasCalled: boolean;
+}
+
+// TTS chunk type
+interface TTSChunk {
+  type: "audio" | "WordBoundary";
+  data?: Uint8Array;
+  duration?: number;
+  offset?: number;
+  text?: string;
+}
 
 /**
  * Configuration options for the Communicate class.
@@ -39,14 +125,13 @@ export interface CommunicateOptions {
   volume?: string;
   /** Pitch adjustment in Hz (e.g., "+5Hz", "-10Hz") */
   pitch?: string;
-  /** Proxy URL for requests */
-  proxy?: string;
   /** WebSocket connection timeout in milliseconds */
   connectionTimeout?: number;
 }
 
 /**
- * Main class for text-to-speech synthesis using Microsoft Edge's online TTS service.
+ * Communicate class for React Native text-to-speech synthesis.
+ * Uses WebSocket to stream audio data from Microsoft Edge's TTS service.
  * 
  * @example
  * ```typescript
@@ -63,12 +148,10 @@ export interface CommunicateOptions {
  */
 export class Communicate {
   private readonly ttsConfig: TTSConfig;
-  private readonly texts: Generator<Buffer>;
-  private readonly proxy?: string;
-  private readonly connectionTimeout?: number;
+  private readonly texts: Generator<Uint8Array>;
 
   private state: CommunicateState = {
-    partialText: Buffer.from(''),
+    partialText: BufferUtils.from(''),
     offsetCompensation: 0,
     lastDurationOffset: 0,
     streamWasCalled: false,
@@ -92,18 +175,19 @@ export class Communicate {
       throw new TypeError('text must be a string');
     }
 
-    this.texts = splitTextByByteLength(
-      escape(removeIncompatibleCharacters(text)),
-      // calcMaxMesgSize(this.ttsConfig),
-      4096,
-    );
+    // Create a generator that yields Uint8Array chunks
+    const processedText = escape(removeIncompatibleCharacters(text));
+    const maxSize = 4096;
 
-    this.proxy = options.proxy;
-    this.connectionTimeout = options.connectionTimeout;
+    this.texts = (function* () {
+      for (const chunk of splitTextByByteLength(processedText, maxSize)) {
+        yield new TextEncoder().encode(chunk);
+      }
+    })();
   }
 
-  private parseMetadata(data: Buffer): TTSChunk {
-    const metadata = JSON.parse(data.toString('utf-8'));
+  private parseMetadata(data: Uint8Array): TTSChunk {
+    const metadata = JSON.parse(BufferUtils.toString(data));
     for (const metaObj of metadata['Metadata']) {
       const metaType = metaObj['Type'];
       if (metaType === 'WordBoundary') {
@@ -124,43 +208,34 @@ export class Communicate {
     throw new UnexpectedResponse('No WordBoundary metadata found');
   }
 
-  private async * _stream(): AsyncGenerator<TTSChunk, void, unknown> {
-    const url = `${WSS_URL}&Sec-MS-GEC=${DRM.generateSecMsGec()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connectId()}`;
-
-    let agent: any;
-    if (this.proxy) {
-      // Import HttpsProxyAgent dynamically only when needed
-      if (!HttpsProxyAgent) {
-        try {
-          const proxyModule = await import('https-proxy-agent');
-          HttpsProxyAgent = proxyModule.HttpsProxyAgent;
-        } catch (e) {
-          console.warn('https-proxy-agent not available:', e);
-        }
-      }
-      if (HttpsProxyAgent) {
-        agent = new HttpsProxyAgent(this.proxy);
-      }
-    }
-
-    const websocket = new WebSocket(url, {
+  private createWebSocket(url: string): WebSocket {
+    // React Native: supports headers in the 3rd argument
+    const RNWebSocket = WebSocket as any;
+    return new RNWebSocket(url, null, {
       headers: WSS_HEADERS,
-      timeout: this.connectionTimeout,
-      agent: agent,
     });
+  }
 
+  private async * _stream(): AsyncGenerator<TTSChunk, void, unknown> {
+    const url = `${WSS_URL}&Sec-MS-GEC=${await DRM.generateSecMsGec()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connectId()}`;
+
+    const websocket = this.createWebSocket(url);
     const messageQueue: (TTSChunk | Error | 'close')[] = [];
     let resolveMessage: (() => void) | null = null;
 
-    websocket.on('message', (message: Buffer, isBinary: boolean) => {
-      if (!isBinary) {
-        // text message
-        const [headers, data] = getHeadersAndDataFromText(message);
+    // Handle WebSocket messages
+    const handleMessage = (message: any) => {
+      const data = message.data || message;
+      const binary = data instanceof ArrayBuffer || data instanceof Uint8Array;
+
+      if (!binary && typeof data === 'string') {
+        // Text message
+        const [headers, parsedData] = getHeadersAndDataFromText(BufferUtils.from(data));
 
         const path = headers['Path'];
         if (path === 'audio.metadata') {
           try {
-            const parsedMetadata = this.parseMetadata(data);
+            const parsedMetadata = this.parseMetadata(parsedData);
             this.state.lastDurationOffset = parsedMetadata.offset! + parsedMetadata.duration!;
             messageQueue.push(parsedMetadata);
           } catch (e) {
@@ -173,48 +248,78 @@ export class Communicate {
           messageQueue.push(new UnknownResponse(`Unknown path received: ${path}`));
         }
       } else {
-        // binary message
-        if (message.length < 2) {
-          messageQueue.push(new UnexpectedResponse('We received a binary message, but it is missing the header length.'));
-        } else {
-          const headerLength = message.readUInt16BE(0);
-          if (headerLength > message.length) {
-            messageQueue.push(new UnexpectedResponse('The header length is greater than the length of the data.'));
-          } else {
-            const [headers, data] = getHeadersAndDataFromBinary(message);
+        // Binary message
+        let bufferData: Uint8Array;
 
-            if (headers['Path'] !== 'audio') {
-              messageQueue.push(new UnexpectedResponse('Received binary message, but the path is not audio.'));
-            } else {
-              const contentType = headers['Content-Type'];
-              if (contentType !== 'audio/mpeg') {
-                if (data.length > 0) {
-                  messageQueue.push(new UnexpectedResponse('Received binary message, but with an unexpected Content-Type.'));
-                }
-              } else if (data.length === 0) {
-                messageQueue.push(new UnexpectedResponse('Received binary message, but it is missing the audio data.'));
-              } else {
-                messageQueue.push({ type: 'audio', data: data });
-              }
+        if (data instanceof ArrayBuffer) {
+          bufferData = BufferUtils.from(data);
+        } else if (data instanceof Uint8Array) {
+          bufferData = data;
+        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+          // Handle Blob - process async
+          data.arrayBuffer().then(arrayBuffer => {
+            const blobBufferData = new Uint8Array(arrayBuffer);
+            processBinaryData(blobBufferData);
+          }).catch(error => {
+            messageQueue.push(new UnexpectedResponse(`Failed to process Blob data: ${error.message}`));
+            if (resolveMessage) resolveMessage();
+          });
+          return;
+        } else {
+          messageQueue.push(new UnexpectedResponse(`Unknown binary data type: ${typeof data} ${data.constructor?.name}`));
+          return;
+        }
+
+        processBinaryData(bufferData);
+      }
+
+      if (resolveMessage) resolveMessage();
+    };
+
+    const processBinaryData = (bufferData: Uint8Array) => {
+      if (bufferData.length < 2) {
+        messageQueue.push(new UnexpectedResponse('We received a binary message, but it is missing the header length.'));
+      } else {
+        const [headers, audioData] = getHeadersAndDataFromBinary(bufferData);
+
+        if (headers['Path'] !== 'audio') {
+          messageQueue.push(new UnexpectedResponse('Received binary message, but the path is not audio.'));
+        } else {
+          const contentType = headers['Content-Type'];
+          if (contentType !== 'audio/mpeg') {
+            if (audioData.length > 0) {
+              messageQueue.push(new UnexpectedResponse('Received binary message, but with an unexpected Content-Type.'));
             }
+          } else if (audioData.length === 0) {
+            messageQueue.push(new UnexpectedResponse('Received binary message, but it is missing the audio data.'));
+          } else {
+            messageQueue.push({ type: 'audio', data: audioData });
           }
         }
       }
-      if (resolveMessage) resolveMessage();
-    });
+    };
 
-    websocket.on('error', (error) => {
-      messageQueue.push(new WebSocketError(error.message));
+    // Set up WebSocket event handlers
+    websocket.onmessage = handleMessage;
+    websocket.onerror = (error: any) => {
+      messageQueue.push(new WebSocketError(error.message || 'WebSocket error'));
       if (resolveMessage) resolveMessage();
-    });
-
-    websocket.on('close', () => {
+    };
+    websocket.onclose = () => {
       messageQueue.push('close');
       if (resolveMessage) resolveMessage();
+    };
+
+    // Wait for connection
+    await new Promise<void>((resolve, reject) => {
+      const onOpen = () => resolve();
+      const onError = (error: any) => reject(error);
+
+      websocket.onopen = onOpen;
+      websocket.onerror = onError;
     });
 
-    await new Promise<void>(resolve => websocket.on('open', resolve));
-
+    // Send configuration
     websocket.send(
       `X-Timestamp:${dateToString()}\r\n`
       + 'Content-Type:application/json; charset=utf-8\r\n'
@@ -225,14 +330,16 @@ export class Communicate {
       + '}}}}\r\n'
     );
 
+    // Send SSML
     websocket.send(
       ssmlHeadersPlusData(
         connectId(),
         dateToString(),
-        mkssml(this.ttsConfig, this.state.partialText),
+        mkssml(this.ttsConfig, BufferUtils.toString(this.state.partialText)),
       )
     );
 
+    // Process messages
     let audioWasReceived = false;
     while (true) {
       if (messageQueue.length > 0) {
@@ -249,10 +356,9 @@ export class Communicate {
           yield message;
         }
       } else {
-        // Use a more responsive wait mechanism
+        // Wait for messages
         await new Promise<void>(resolve => {
           resolveMessage = resolve;
-          // Add a small timeout to prevent indefinite waiting
           setTimeout(resolve, 50);
         });
       }
@@ -262,24 +368,10 @@ export class Communicate {
   /**
    * Streams text-to-speech synthesis results.
    * 
-   * Returns an async generator that yields audio chunks and word boundary events.
-   * Can only be called once per Communicate instance.
-   * 
    * @yields TTSChunk - Audio data or word boundary information
    * @throws {Error} If called more than once
    * @throws {NoAudioReceived} If no audio data is received
    * @throws {WebSocketError} If WebSocket connection fails
-   * 
-   * @example
-   * ```typescript
-   * for await (const chunk of communicate.stream()) {
-   *   if (chunk.type === 'audio') {
-   *     // Process audio data
-   *   } else if (chunk.type === 'WordBoundary') {
-   *     // Process subtitle timing
-   *   }
-   * }
-   * ```
    */
   async * stream(): AsyncGenerator<TTSChunk, void, unknown> {
     if (this.state.streamWasCalled) {
@@ -289,20 +381,9 @@ export class Communicate {
 
     for (const partialText of this.texts) {
       this.state.partialText = partialText;
-      try {
-        for await (const message of this._stream()) {
-          yield message;
-        }
-      } catch (e) {
-        if (e instanceof AxiosError && e.response?.status === 403) {
-          DRM.handleClientResponseError(e);
-          for await (const message of this._stream()) {
-            yield message;
-          }
-        } else {
-          throw e;
-        }
+      for await (const message of this._stream()) {
+        yield message;
       }
     }
   }
-} 
+}

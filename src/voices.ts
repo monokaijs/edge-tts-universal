@@ -1,51 +1,82 @@
-import axios, { AxiosError, AxiosProxyConfig } from 'axios';
+// Use native fetch API available in React Native and browsers
 import { SEC_MS_GEC_VERSION, VOICE_HEADERS, VOICE_LIST_URL } from './constants';
 import { DRM } from './drm';
 import { Voice, VoicesManagerFind, VoicesManagerVoice } from './types';
 
-function buildProxyConfig(proxy: string): AxiosProxyConfig | false {
-  try {
-    const proxyUrl = new URL(proxy);
-    return {
-      host: proxyUrl.hostname,
-      port: parseInt(proxyUrl.port),
-      protocol: proxyUrl.protocol,
-    };
-  } catch (e) {
-    // if proxy is not a valid URL, just ignore it.
-    return false;
+/**
+ * Error class for fetch-related errors (isomorphic equivalent of AxiosError)
+ */
+export class FetchError extends Error {
+  response?: {
+    status: number;
+    headers: Record<string, string>;
+  };
+
+  constructor(message: string, response?: { status: number; headers: Record<string, string> }) {
+    super(message);
+    this.name = 'FetchError';
+    this.response = response;
   }
 }
 
 async function _listVoices(proxy?: string): Promise<Voice[]> {
-  const url = `${VOICE_LIST_URL}&Sec-MS-GEC=${DRM.generateSecMsGec()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`;
-  const response = await axios.get<Voice[]>(url, {
+  const url = `${VOICE_LIST_URL}&Sec-MS-GEC=${await DRM.generateSecMsGec()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`;
+
+  const fetchOptions: RequestInit = {
     headers: VOICE_HEADERS,
-    proxy: proxy ? buildProxyConfig(proxy) : false,
-  });
+  };
 
-  const data = response.data;
-
-  for (const voice of data) {
-    voice.VoiceTag.ContentCategories = voice.VoiceTag.ContentCategories.map(c => c.trim() as any);
-    voice.VoiceTag.VoicePersonalities = voice.VoiceTag.VoicePersonalities.map(p => p.trim() as any);
+  // Note: Proxy support in browsers is limited and handled differently
+  // In Node.js, we could potentially use a proxy agent with fetch
+  if (proxy) {
+    console.warn('Proxy support in isomorphic environment is limited. Consider using a backend proxy.');
   }
 
-  return data;
+  try {
+    const response = await fetch(url, fetchOptions);
+
+    if (!response.ok) {
+      const headers: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+
+      throw new FetchError(`HTTP ${response.status}`, {
+        status: response.status,
+        headers
+      });
+    }
+
+    const data: Voice[] = await response.json();
+
+    for (const voice of data) {
+      voice.VoiceTag.ContentCategories = voice.VoiceTag.ContentCategories.map(c => c.trim() as any);
+      voice.VoiceTag.VoicePersonalities = voice.VoiceTag.VoicePersonalities.map(p => p.trim() as any);
+    }
+
+    return data;
+  } catch (error) {
+    if (error instanceof FetchError) {
+      throw error;
+    }
+    // Convert other fetch errors to our FetchError format
+    throw new FetchError(error instanceof Error ? error.message : 'Unknown fetch error');
+  }
 }
 
 /**
- * Fetches all available voices from the Microsoft Edge TTS service.
+ * Fetches all available voices from the Microsoft Edge TTS service (isomorphic version).
+ * Works in both Node.js and browsers (subject to CORS policy).
  * 
- * @param proxy - Optional proxy URL for the request
+ * @param proxy - Optional proxy URL for the request (limited browser support)
  * @returns Promise resolving to array of available voices
  */
 export async function listVoices(proxy?: string): Promise<Voice[]> {
   try {
     return await _listVoices(proxy);
   } catch (e) {
-    if (e instanceof AxiosError && e.response?.status === 403) {
-      DRM.handleClientResponseError(e);
+    if (e instanceof FetchError && e.response?.status === 403) {
+      DRM.handleClientResponseError(e.response);
       return await _listVoices(proxy);
     }
     throw e;
